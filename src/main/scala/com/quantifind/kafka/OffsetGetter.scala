@@ -1,10 +1,14 @@
 package com.quantifind.kafka
 
+import org.json4s
+import org.json4s.JsonAST.{JString, JInt, JField, JObject}
+import org.json4s.native.JsonMethods
+
 import scala.collection._
 
 import com.quantifind.kafka.OffsetGetter.{BrokerInfo, KafkaInfo, OffsetInfo}
 import kafka.api.{OffsetRequest, PartitionOffsetRequestInfo}
-import kafka.common.{BrokerNotAvailableException, TopicAndPartition}
+import kafka.common.{KafkaException, BrokerNotAvailableException, TopicAndPartition}
 import kafka.consumer.SimpleConsumer
 import kafka.utils.{Json, Logging, ZkUtils}
 import org.I0Itec.zkclient.ZkClient
@@ -12,6 +16,7 @@ import org.I0Itec.zkclient.exception.ZkNoNodeException
 import com.twitter.util.Time
 import org.apache.zookeeper.data.Stat
 import scala.util.control.NonFatal
+import scala.util.parsing.json.JSON
 
 /**
  * a nicer version of kafka's ConsumerOffsetChecker tool
@@ -22,9 +27,11 @@ import scala.util.control.NonFatal
 case class Node(name: String, children: Seq[Node] = Seq())
 
 case class TopicDetails(consumers: Seq[ConsumerDetail])
+
 case class TopicDetailsWrapper(consumers: TopicDetails)
 
 case class TopicAndConsumersDetails(active: Seq[KafkaInfo], inactive: Seq[KafkaInfo])
+
 case class TopicAndConsumersDetailsWrapper(consumers: TopicAndConsumersDetails)
 
 case class ConsumerDetail(name: String)
@@ -125,9 +132,78 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     }
   }
 
+  def getStormConsumer(host: String, port: Int) = {
+    Some(new SimpleConsumer(host, port, 10000, 100000, "ConsumerOffsetChecker"))
+  }
+
+  def getStormOffsetInfo(group: String, topics: Seq[String] = Seq()): Seq[OffsetInfo] = {
+    try {
+      info(s"trying to get storm topics for $group")
+      ZkUtils.getChildren(zkClient, s"/storm/$group").flatMap(path => {
+        info(s"Group $group and path $path")
+        ZkUtils.readDataMaybeNull(zkClient, s"/storm/$group/$path") match {
+          case (Some(partitionInfoString), stat) =>
+            parseStormWithJson4s(group, partitionInfoString, stat)
+        }
+      })
+    } catch {
+      case t: Exception => error("Could not process storm offsets", t)
+        Seq()
+    }
+
+  }
+
+  def parseStormWithJson4s(group:String, partitionInfoString: String, stat: Stat): Seq[OffsetInfo] = {
+    val json = JsonMethods.parse(partitionInfoString)
+    for {
+      JObject(child) <- json
+      JField("broker", JObject(broker)) <- child
+      JField("port", JInt(port)) <- broker
+      JField("host", JString(host)) <- broker
+      JField("offset", JInt(offset)) <- child
+      JField("partition", JInt(partition)) <- child
+      JField("topology", JObject(topology)) <- child
+      JField("name", JString(name)) <- topology
+      JField("topic", JString(topic)) <- child
+      logSize = readLogSize(port.toInt, host, partition.toInt, topic)
+    } yield OffsetInfo(group = group,
+      topic = topic,
+      partition = partition.toInt,
+      offset = offset.toLong,
+      logSize = logSize.get,
+      owner = Some(name),
+      creation = Time.fromMilliseconds(stat.getCtime),
+      modified = Time.fromMilliseconds(stat.getMtime))
+
+
+  }
+
+  def readLogSize(port: Int, host: String, partition: Int, topic: String): Option[Long] = {
+    val logSize = ZkUtils.getLeaderForPartition(zkClient, topic, partition) match {
+      case Some(bid) =>
+        val consumerOpt = consumerMap.getOrElseUpdate(bid, getStormConsumer(host, port))
+        consumerOpt map {
+          consumer =>
+            val topicAndPartition = TopicAndPartition(topic, partition)
+            val request =
+              OffsetRequest(immutable.Map(topicAndPartition -> PartitionOffsetRequestInfo(OffsetRequest.LatestTime, 1)))
+            consumer.getOffsetsBefore(request).partitionErrorAndOffsets(topicAndPartition).offsets.head
+        }
+    }
+    logSize
+  }
+
   def getInfo(group: String, topics: Seq[String] = Seq()): KafkaInfo = {
-    val off = offsetInfo(group, topics)
+    info(s"getting info for $group, storm groups are $stormGroups")
+    if (stormGroups.isEmpty)
+      loadStormGroups
+
+    val off = if (stormGroups.contains(group))
+      getStormOffsetInfo(group, topics).toSeq
+    else
+      offsetInfo(group, topics)
     val brok = brokerInfo()
+    info(s"offset info $off")
     KafkaInfo(
       name = group,
       brokers = brok.toSeq,
@@ -135,9 +211,22 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     )
   }
 
+  var stormGroups: List[String] = List()
+
   def getGroups: Seq[String] = {
     try {
-      ZkUtils.getChildren(zkClient, ZkUtils.ConsumersPath)
+      ZkUtils.getChildren(zkClient, ZkUtils.ConsumersPath) ++ loadStormGroups
+    } catch {
+      case NonFatal(t) =>
+        error(s"could not get groups because of ${t.getMessage}", t)
+        Seq()
+    }
+  }
+
+  def loadStormGroups = {
+    try {
+      stormGroups = ZkUtils.getChildren(zkClient, "/storm").toList
+      stormGroups
     } catch {
       case NonFatal(t) =>
         error(s"could not get groups because of ${t.getMessage}", t)
@@ -172,9 +261,9 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
     val activeTopicMap = getActiveTopicMap
 
     val activeConsumers = if (activeTopicMap.contains(topic)) {
-        mapConsumersToKafkaInfo(activeTopicMap(topic), topic)
+      mapConsumersToKafkaInfo(activeTopicMap(topic), topic)
     } else {
-        Seq()
+      Seq()
     }
 
     val inactiveConsumers = if (!activeTopicMap.contains(topic) && topicMap.contains(topic)) {
@@ -277,6 +366,7 @@ class OffsetGetter(zkClient: ZkClient) extends Logging {
   }
 
 }
+
 
 object OffsetGetter {
 
